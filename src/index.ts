@@ -9,14 +9,19 @@ import {
   type WsPositionUpdate,
   type Market,
 } from "risex-client";
-import { ethers } from "ethers";
 
 const ACCOUNT_ADDRESS = process.env.ACCOUNT_ADDRESS!;
 const SIGNER_PRIVATE_KEY = process.env.SIGNER_PRIVATE_KEY!;
 const TARGET_ADDRESS =
   process.env.TARGET_ADDRESS ||
   "0x00FA797B694Ecf18B71d8Bbe83612392364A1Ea1";
-const COPY_RATIO = parseFloat(process.env.COPY_RATIO || "1.0");
+
+const TARGET_BALANCE_USD = parseFloat(process.env.TARGET_BALANCE_USD || "4500");
+const MY_BALANCE_USD = parseFloat(process.env.MY_BALANCE_USD || "100");
+const FIXED_LEVERAGE = parseInt(process.env.FIXED_LEVERAGE || "20", 10);
+const MIN_ORDER_VOLUME_USD = parseFloat(process.env.MIN_ORDER_VOLUME_USD || "1.5");
+const MAX_POSITIONS = parseInt(process.env.MAX_POSITIONS || "3", 10);
+const MAX_DAILY_LOSS_USD = parseFloat(process.env.MAX_DAILY_LOSS_USD || "20");
 
 const API_URL = "https://api.risex.trade";
 const WS_URL = "wss://ws.risex.trade";
@@ -25,6 +30,8 @@ if (!ACCOUNT_ADDRESS || !SIGNER_PRIVATE_KEY) {
   console.error("Missing ACCOUNT_ADDRESS or SIGNER_PRIVATE_KEY in .env");
   process.exit(1);
 }
+
+const BASE_RATIO = MY_BALANCE_USD / TARGET_BALANCE_USD;
 
 interface TrackedPosition {
   size: bigint;
@@ -37,6 +44,31 @@ let markets: Market[] = [];
 let processing = false;
 const pendingQueue: WsPositionUpdate[] = [];
 
+let dailyLoss = 0;
+let dailyLossResetDate = todayDateStr();
+
+function todayDateStr(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function checkAndResetDailyLoss() {
+  const today = todayDateStr();
+  if (today !== dailyLossResetDate) {
+    dailyLoss = 0;
+    dailyLossResetDate = today;
+    console.log("[RISK] Daily loss counter reset");
+  }
+}
+
+function canTrade(): boolean {
+  checkAndResetDailyLoss();
+  if (dailyLoss >= MAX_DAILY_LOSS_USD) {
+    console.warn(`[RISK] Daily loss limit reached ($${dailyLoss.toFixed(2)} / $${MAX_DAILY_LOSS_USD}), skipping trade`);
+    return false;
+  }
+  return true;
+}
+
 function marketIdNum(id: string | number): number {
   return typeof id === "string" ? parseInt(id, 10) : id;
 }
@@ -47,13 +79,40 @@ function getMarketConfig(marketId: number) {
 
 function sizeToSteps(size: bigint, stepSize: string): number {
   const step = parseWad(stepSize);
+  if (step === 0n) return 0;
   return Number(size / step);
 }
 
-function applyRatio(size: bigint): bigint {
-  if (COPY_RATIO === 1.0) return size;
-  const scaled = (size * BigInt(Math.round(COPY_RATIO * 1e6))) / 1_000_000n;
+function getMarkPrice(market: Market): number {
+  return parseFloat(formatWad(market.mark_price));
+}
+
+function scaleSize(targetSizeWad: bigint, market: Market): bigint {
+  let scaled = (targetSizeWad * BigInt(Math.round(BASE_RATIO * 1e8))) / 100_000_000n;
+
+  const markPrice = getMarkPrice(market);
+  if (markPrice <= 0) return scaled;
+
+  const sizeFloat = parseFloat(formatWad(scaled.toString()));
+  const volumeUsd = sizeFloat * markPrice;
+
+  if (volumeUsd < MIN_ORDER_VOLUME_USD) {
+    const minSize = MIN_ORDER_VOLUME_USD / markPrice;
+    scaled = parseWad(minSize.toFixed(18));
+  }
+
+  const maxVolumePerPosition = (MY_BALANCE_USD * FIXED_LEVERAGE) / MAX_POSITIONS;
+  if (volumeUsd > maxVolumePerPosition) {
+    const cappedSize = maxVolumePerPosition / markPrice;
+    scaled = parseWad(cappedSize.toFixed(18));
+    console.log(`[RISK] Capped position to $${maxVolumePerPosition.toFixed(2)} notional`);
+  }
+
   return scaled;
+}
+
+function activePositionCount(): number {
+  return targetPositions.size;
 }
 
 async function handlePositionUpdate(update: WsPositionUpdate) {
@@ -80,7 +139,7 @@ async function handlePositionUpdate(update: WsPositionUpdate) {
   const stepSize = market.config.step_size;
 
   if (newSizeWad === 0n && prevSize > 0n) {
-    console.log(`[COPY] Target closed position on market ${market.display_name}`);
+    console.log(`[COPY] Target fully closed on ${market.display_name} → closing our position`);
     try {
       const result = await exchange.closePosition(mktId);
       if (result) {
@@ -89,21 +148,33 @@ async function handlePositionUpdate(update: WsPositionUpdate) {
         console.log(`[COPY] No position to close on ${market.display_name}`);
       }
     } catch (err) {
-      console.error(`[COPY] Failed to close position on ${market.display_name}:`, err);
+      console.error(`[COPY] Failed to close on ${market.display_name}:`, err);
     }
     return;
   }
 
   if (prevSize === 0n && newSizeWad > 0n) {
-    const copySize = applyRatio(newSizeWad);
-    const steps = sizeToSteps(copySize, stepSize);
-    if (steps <= 0) {
-      console.warn(`[COPY] Calculated 0 steps for market ${market.display_name}, skipping`);
+    if (!canTrade()) return;
+
+    if (activePositionCount() > MAX_POSITIONS) {
+      console.warn(`[RISK] Max ${MAX_POSITIONS} positions reached, skipping new position on ${market.display_name}`);
       return;
     }
+
+    const copySize = scaleSize(newSizeWad, market);
+    const steps = sizeToSteps(copySize, stepSize);
+    if (steps <= 0) {
+      console.warn(`[COPY] Calculated 0 steps for ${market.display_name}, skipping`);
+      return;
+    }
+
+    const markPrice = getMarkPrice(market);
+    const notional = parseFloat(formatWad(copySize.toString())) * markPrice;
     console.log(
-      `[COPY] Target opened ${newSide === Side.Long ? "LONG" : "SHORT"} ${formatWad(copySize.toString())} on ${market.display_name}`
+      `[COPY] Target opened ${newSide === Side.Long ? "LONG" : "SHORT"} on ${market.display_name} ` +
+      `| Target size: ${formatWad(newSizeWad.toString())} | Our size: ${formatWad(copySize.toString())} (~$${notional.toFixed(2)})`
     );
+
     try {
       const result =
         newSide === Side.Long
@@ -111,19 +182,22 @@ async function handlePositionUpdate(update: WsPositionUpdate) {
           : await exchange.marketSell(mktId, steps);
       console.log(`[COPY] Opened position: tx=${result.tx_hash}`);
     } catch (err) {
-      console.error(`[COPY] Failed to open position on ${market.display_name}:`, err);
+      console.error(`[COPY] Failed to open on ${market.display_name}:`, err);
     }
     return;
   }
 
   if (prevSize > 0n && newSizeWad > 0n && prevSide !== newSide) {
-    console.log(`[COPY] Target flipped position on ${market.display_name}`);
+    console.log(`[COPY] Target flipped on ${market.display_name} → closing & reopening`);
     try {
       const closeResult = await exchange.closePosition(mktId);
       if (closeResult) {
         console.log(`[COPY] Closed old position: tx=${closeResult.tx_hash}`);
       }
-      const copySize = applyRatio(newSizeWad);
+
+      if (!canTrade()) return;
+
+      const copySize = scaleSize(newSizeWad, market);
       const steps = sizeToSteps(copySize, stepSize);
       if (steps > 0) {
         const result =
@@ -133,7 +207,7 @@ async function handlePositionUpdate(update: WsPositionUpdate) {
         console.log(`[COPY] Opened flipped position: tx=${result.tx_hash}`);
       }
     } catch (err) {
-      console.error(`[COPY] Failed to flip position on ${market.display_name}:`, err);
+      console.error(`[COPY] Failed to flip on ${market.display_name}:`, err);
     }
     return;
   }
@@ -142,12 +216,17 @@ async function handlePositionUpdate(update: WsPositionUpdate) {
     const sizeDelta = newSizeWad - prevSize;
     if (sizeDelta === 0n) return;
 
-    const copyDelta = applyRatio(sizeDelta > 0n ? sizeDelta : -sizeDelta);
-    const steps = sizeToSteps(copyDelta, stepSize);
-    if (steps <= 0) return;
-
     if (sizeDelta > 0n) {
-      console.log(`[COPY] Target increased position on ${market.display_name} by ${formatWad(copyDelta.toString())}`);
+      if (!canTrade()) return;
+
+      const scaledDelta = scaleSize(sizeDelta, market);
+      const steps = sizeToSteps(scaledDelta, stepSize);
+      if (steps <= 0) return;
+
+      const markPrice = getMarkPrice(market);
+      const notional = parseFloat(formatWad(scaledDelta.toString())) * markPrice;
+      console.log(`[COPY] Target increased on ${market.display_name} | +${formatWad(scaledDelta.toString())} (~$${notional.toFixed(2)})`);
+
       try {
         const result =
           newSide === Side.Long
@@ -155,18 +234,56 @@ async function handlePositionUpdate(update: WsPositionUpdate) {
             : await exchange.marketSell(mktId, steps);
         console.log(`[COPY] Increased position: tx=${result.tx_hash}`);
       } catch (err) {
-        console.error(`[COPY] Failed to increase position:`, err);
+        console.error(`[COPY] Failed to increase:`, err);
       }
     } else {
-      console.log(`[COPY] Target decreased position on ${market.display_name} by ${formatWad(copyDelta.toString())}`);
+      const reduction = -sizeDelta;
+      const reductionRatio = Number((reduction * 10000n) / prevSize) / 10000;
+
+      if (reductionRatio > 0.95) {
+        console.log(`[COPY] Target closed ~100% on ${market.display_name} → closing our position`);
+        try {
+          const result = await exchange.closePosition(mktId);
+          if (result) console.log(`[COPY] Closed position: tx=${result.tx_hash}`);
+        } catch (err) {
+          console.error(`[COPY] Failed to close:`, err);
+        }
+        return;
+      }
+
+      const myPositions = await exchange.info.getAllPositions(ACCOUNT_ADDRESS);
+      const myPos = myPositions.find((p) => parseInt(p.market_id, 10) === mktId);
+      if (!myPos) {
+        console.warn(`[COPY] No position found to reduce on ${market.display_name}`);
+        return;
+      }
+
+      const mySizeWad = parseWad(myPos.size);
+      const closeAmount = BigInt(Math.round(Number(mySizeWad) * reductionRatio));
+      const steps = sizeToSteps(closeAmount, stepSize);
+      if (steps <= 0) return;
+
+      const markPrice = getMarkPrice(market);
+      const notional = parseFloat(formatWad(closeAmount.toString())) * markPrice;
+      console.log(
+        `[COPY] Target reduced ${(reductionRatio * 100).toFixed(1)}% on ${market.display_name} ` +
+        `| Closing ${formatWad(closeAmount.toString())} (~$${notional.toFixed(2)})`
+      );
+
       try {
         const result =
           newSide === Side.Long
             ? await exchange.marketSell(mktId, steps, true)
             : await exchange.marketBuy(mktId, steps);
-        console.log(`[COPY] Decreased position: tx=${result.tx_hash}`);
+        console.log(`[COPY] Reduced position: tx=${result.tx_hash}`);
+
+        const pnl = myPos.unrealized_pnl ? parseFloat(formatWad(myPos.unrealized_pnl)) : 0;
+        if (pnl < 0) {
+          dailyLoss += Math.abs(pnl) * reductionRatio;
+          console.log(`[RISK] Daily loss now: $${dailyLoss.toFixed(2)} / $${MAX_DAILY_LOSS_USD}`);
+        }
       } catch (err) {
-        console.error(`[COPY] Failed to decrease position:`, err);
+        console.error(`[COPY] Failed to reduce:`, err);
       }
     }
   }
@@ -234,9 +351,13 @@ async function connectWebSocket() {
 
 async function main() {
   console.log("=== RISEx Copy Trade Bot ===");
-  console.log(`Account:  ${ACCOUNT_ADDRESS}`);
-  console.log(`Target:   ${TARGET_ADDRESS}`);
-  console.log(`Ratio:    ${COPY_RATIO}`);
+  console.log(`Account:    ${ACCOUNT_ADDRESS}`);
+  console.log(`Target:     ${TARGET_ADDRESS}`);
+  console.log(`Mode:       proportional (${MY_BALANCE_USD}$ / ${TARGET_BALANCE_USD}$ = ${(BASE_RATIO * 100).toFixed(2)}%)`);
+  console.log(`Leverage:   x${FIXED_LEVERAGE}`);
+  console.log(`Min order:  $${MIN_ORDER_VOLUME_USD}`);
+  console.log(`Max pos:    ${MAX_POSITIONS}`);
+  console.log(`Max loss:   $${MAX_DAILY_LOSS_USD}/day`);
   console.log();
 
   exchange = new ExchangeClient({
