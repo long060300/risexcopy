@@ -1,12 +1,10 @@
 import "dotenv/config";
 import {
   ExchangeClient,
-  WebSocketClient,
   Side,
   formatWad,
   parseWad,
-  type WsMessage,
-  type WsPositionUpdate,
+  type Position,
   type Market,
 } from "risex-client";
 
@@ -22,9 +20,10 @@ const FIXED_LEVERAGE = parseInt(process.env.FIXED_LEVERAGE || "20", 10);
 const MIN_ORDER_VOLUME_USD = parseFloat(process.env.MIN_ORDER_VOLUME_USD || "1.5");
 const MAX_POSITIONS = parseInt(process.env.MAX_POSITIONS || "3", 10);
 const MAX_DAILY_LOSS_USD = parseFloat(process.env.MAX_DAILY_LOSS_USD || "20");
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "2000", 10);
 
-const API_URL = "https://api.risex.trade";
-const WS_URL = "wss://ws.risex.trade";
+const API_URL = "https://api.rise.trade";
+const WS_URL = "wss://ws.rise.trade";
 
 if (!ACCOUNT_ADDRESS || !SIGNER_PRIVATE_KEY) {
   console.error("Missing ACCOUNT_ADDRESS or SIGNER_PRIVATE_KEY in .env");
@@ -41,8 +40,6 @@ interface TrackedPosition {
 const targetPositions = new Map<number, TrackedPosition>();
 let exchange: ExchangeClient;
 let markets: Market[] = [];
-let processing = false;
-const pendingQueue: WsPositionUpdate[] = [];
 
 let dailyLoss = 0;
 let dailyLossResetDate = todayDateStr();
@@ -111,33 +108,20 @@ function scaleSize(targetSizeWad: bigint, market: Market): bigint {
   return scaled;
 }
 
-function activePositionCount(): number {
-  return targetPositions.size;
-}
-
-async function handlePositionUpdate(update: WsPositionUpdate) {
-  const mktId = marketIdNum(update.market_id);
+async function handleChange(mktId: number, newSizeWad: bigint, newSide: Side) {
   const market = getMarketConfig(mktId);
   if (!market) {
     console.warn(`Unknown market ${mktId}, skipping`);
     return;
   }
 
-  const newSizeWad = parseWad(update.size);
-  const newSide: Side = update.side;
   const prev = targetPositions.get(mktId);
-
   const prevSize = prev?.size ?? 0n;
   const prevSide = prev?.side ?? Side.Long;
 
-  if (newSizeWad === 0n) {
-    targetPositions.delete(mktId);
-  } else {
-    targetPositions.set(mktId, { size: newSizeWad, side: newSide });
-  }
-
   const stepSize = market.config.step_size;
 
+  // Target fully closed
   if (newSizeWad === 0n && prevSize > 0n) {
     console.log(`[COPY] Target fully closed on ${market.display_name} → closing our position`);
     try {
@@ -153,10 +137,11 @@ async function handlePositionUpdate(update: WsPositionUpdate) {
     return;
   }
 
+  // Target opened new position
   if (prevSize === 0n && newSizeWad > 0n) {
     if (!canTrade()) return;
 
-    if (activePositionCount() > MAX_POSITIONS) {
+    if (targetPositions.size >= MAX_POSITIONS) {
       console.warn(`[RISK] Max ${MAX_POSITIONS} positions reached, skipping new position on ${market.display_name}`);
       return;
     }
@@ -187,6 +172,7 @@ async function handlePositionUpdate(update: WsPositionUpdate) {
     return;
   }
 
+  // Target flipped side
   if (prevSize > 0n && newSizeWad > 0n && prevSide !== newSide) {
     console.log(`[COPY] Target flipped on ${market.display_name} → closing & reopening`);
     try {
@@ -212,6 +198,7 @@ async function handlePositionUpdate(update: WsPositionUpdate) {
     return;
   }
 
+  // Target increased or decreased same-side position
   if (prevSize > 0n && newSizeWad > 0n && prevSide === newSide) {
     const sizeDelta = newSizeWad - prevSize;
     if (sizeDelta === 0n) return;
@@ -289,14 +276,48 @@ async function handlePositionUpdate(update: WsPositionUpdate) {
   }
 }
 
-async function processQueue() {
-  if (processing) return;
-  processing = true;
-  while (pendingQueue.length > 0) {
-    const update = pendingQueue.shift()!;
-    await handlePositionUpdate(update);
+async function pollTargetPositions() {
+  try {
+    const positions = await exchange.info.getAllPositions(TARGET_ADDRESS);
+
+    const currentSnapshot = new Map<number, { size: bigint; side: Side }>();
+    for (const pos of positions) {
+      const size = parseWad(pos.size);
+      if (size > 0n) {
+        currentSnapshot.set(parseInt(pos.market_id, 10), {
+          size,
+          side: pos.side as Side,
+        });
+      }
+    }
+
+    const allMarketIds = new Set([
+      ...targetPositions.keys(),
+      ...currentSnapshot.keys(),
+    ]);
+
+    for (const mktId of allMarketIds) {
+      const prev = targetPositions.get(mktId);
+      const curr = currentSnapshot.get(mktId);
+
+      const prevSize = prev?.size ?? 0n;
+      const prevSide = prev?.side ?? Side.Long;
+      const currSize = curr?.size ?? 0n;
+      const currSide = curr?.side ?? Side.Long;
+
+      if (currSize === prevSize && currSide === prevSide) continue;
+
+      await handleChange(mktId, currSize, currSide);
+    }
+
+    // Update snapshot after processing all changes
+    targetPositions.clear();
+    for (const [mktId, pos] of currentSnapshot) {
+      targetPositions.set(mktId, pos);
+    }
+  } catch (err) {
+    console.error("[POLL] Failed to fetch target positions:", err);
   }
-  processing = false;
 }
 
 async function initTargetPositions() {
@@ -316,39 +337,6 @@ async function initTargetPositions() {
   }
 }
 
-async function connectWebSocket() {
-  const ws = new WebSocketClient({ wsUrl: WS_URL, logLevel: "info" });
-
-  ws.on("open", () => {
-    console.log("[WS] Connected");
-    ws.subscribe({
-      channel: "positions",
-      makers: [TARGET_ADDRESS],
-    });
-    console.log(`[WS] Subscribed to positions for ${TARGET_ADDRESS}`);
-  });
-
-  ws.on("close", () => {
-    console.log("[WS] Disconnected, will auto-reconnect...");
-  });
-
-  ws.on("error", (err) => {
-    console.error("[WS] Error:", err);
-  });
-
-  ws.onChannel("positions", (msg: WsMessage) => {
-    const data = msg.data as WsPositionUpdate | WsPositionUpdate[];
-    const updates = Array.isArray(data) ? data : [data];
-    for (const update of updates) {
-      pendingQueue.push(update);
-    }
-    processQueue();
-  });
-
-  await ws.connect();
-  return ws;
-}
-
 async function main() {
   console.log("=== RISEx Copy Trade Bot ===");
   console.log(`Account:    ${ACCOUNT_ADDRESS}`);
@@ -358,6 +346,7 @@ async function main() {
   console.log(`Min order:  $${MIN_ORDER_VOLUME_USD}`);
   console.log(`Max pos:    ${MAX_POSITIONS}`);
   console.log(`Max loss:   $${MAX_DAILY_LOSS_USD}/day`);
+  console.log(`Poll:       every ${POLL_INTERVAL_MS}ms`);
   console.log();
 
   exchange = new ExchangeClient({
@@ -375,9 +364,9 @@ async function main() {
   console.log(`[INIT] Loaded ${markets.length} markets`);
 
   await initTargetPositions();
-  await connectWebSocket();
 
-  console.log("[BOT] Listening for target position changes...");
+  console.log(`[BOT] Polling target positions every ${POLL_INTERVAL_MS}ms...`);
+  setInterval(pollTargetPositions, POLL_INTERVAL_MS);
 }
 
 main().catch((err) => {
