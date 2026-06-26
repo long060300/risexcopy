@@ -17,7 +17,7 @@ const TARGET_ADDRESS =
 const TARGET_BALANCE_USD = parseFloat(process.env.TARGET_BALANCE_USD || "4500");
 const MY_BALANCE_USD = parseFloat(process.env.MY_BALANCE_USD || "100");
 const FIXED_LEVERAGE = parseInt(process.env.FIXED_LEVERAGE || "20", 10);
-const MIN_ORDER_VOLUME_USD = parseFloat(process.env.MIN_ORDER_VOLUME_USD || "1.5");
+const MIN_ORDER_VOLUME_USD = parseFloat(process.env.MIN_ORDER_VOLUME_USD || "10");
 const MAX_POSITIONS = parseInt(process.env.MAX_POSITIONS || "3", 10);
 const MAX_DAILY_LOSS_USD = parseFloat(process.env.MAX_DAILY_LOSS_USD || "20");
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "3000", 10);
@@ -219,7 +219,7 @@ function scaleSize(targetSize: number, marketPrice: number): number {
   return scaled;
 }
 
-async function copyOrder(order: AggregatedOrder) {
+async function copyOrder(order: AggregatedOrder, targetPositions: ScreenerResponse["positions"]) {
   const market = getMarket(order.market_id);
   if (!market) {
     log("COPY", `Unknown market ${order.market_id}, skipping`);
@@ -230,21 +230,67 @@ async function copyOrder(order: AggregatedOrder) {
   const stepSize = parseFloat(market.config.step_size);
 
   if (order.is_closing) {
-    // Target is closing a position
-    log("COPY", `Target CLOSING ${symbol} | PnL: $${order.realized_pnl.toFixed(2)}`);
+    const targetStillHasPosition = targetPositions.some(
+      (p) => parseInt(p.market_id, 10) === order.market_id
+    );
 
-    try {
-      const result = await exchange.closePosition(order.market_id);
-      if (result) {
-        log("COPY", `Closed ${symbol}: tx=${result.tx_hash}`);
-    
-      } else {
-        log("COPY", `No position to close on ${symbol}`);
+    if (targetStillHasPosition) {
+      // Partial close — target still has a position, reduce ours proportionally
+      const myPos = state.my_positions[order.market_id];
+      if (!myPos) {
+        log("COPY", `Target partial closed ${symbol} but we have no position, skipping`);
+        return;
       }
-      delete state.my_positions[order.market_id];
-      saveState();
-    } catch (err) {
-      log("COPY", `Failed to close ${symbol}: ${(err as Error).message}`);
+
+      const targetRemaining = targetPositions.find(
+        (p) => parseInt(p.market_id, 10) === order.market_id
+      )!;
+      const remainingSize = parseFloat(targetRemaining.size);
+      const closedSize = order.total_size;
+      const totalBefore = remainingSize + closedSize;
+      const reductionRatio = closedSize / totalBefore;
+
+      const reduceAmount = myPos.size * reductionRatio;
+      const reduceNotional = reduceAmount * order.avg_price;
+
+      if (reduceNotional < MIN_ORDER_VOLUME_USD) {
+        log("COPY", `Partial close on ${symbol} too small ($${reduceNotional.toFixed(2)} < $${MIN_ORDER_VOLUME_USD}), skipping`);
+        return;
+      }
+
+      const steps = sizeToSteps(reduceAmount, stepSize);
+      if (steps <= 0) return;
+
+      log("COPY", `Target partial closed ${(reductionRatio * 100).toFixed(1)}% of ${symbol} | Reducing ${reduceAmount.toFixed(6)} (~$${reduceNotional.toFixed(2)})`);
+
+      try {
+        const result =
+          myPos.side === "BUY"
+            ? await exchange.marketSell(order.market_id, steps, true)
+            : await exchange.marketBuy(order.market_id, steps);
+        log("COPY", `Reduced ${symbol}: tx=${result.tx_hash}`);
+        myPos.size -= reduceAmount;
+        if (myPos.size <= 0) delete state.my_positions[order.market_id];
+        saveState();
+      } catch (err) {
+        log("COPY", `Failed to reduce ${symbol}: ${(err as Error).message}`);
+      }
+    } else {
+      // Full close — target has no remaining position
+      log("COPY", `Target FULLY CLOSED ${symbol} | PnL: $${order.realized_pnl.toFixed(2)}`);
+
+      try {
+        const result = await exchange.closePosition(order.market_id);
+        if (result) {
+          log("COPY", `Closed ${symbol}: tx=${result.tx_hash}`);
+        } else {
+          log("COPY", `No position to close on ${symbol}`);
+        }
+        delete state.my_positions[order.market_id];
+        saveState();
+      } catch (err) {
+        log("COPY", `Failed to close ${symbol}: ${(err as Error).message}`);
+      }
     }
     return;
   }
@@ -303,9 +349,7 @@ async function poll() {
 
     const orders = aggregateFills(newFills);
     for (const order of orders) {
-
-
-      await copyOrder(order);
+      await copyOrder(order, data.positions);
     }
 
     // Update state with latest fill time
