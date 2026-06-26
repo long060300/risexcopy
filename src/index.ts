@@ -1,15 +1,13 @@
 import "dotenv/config";
+import axios from "axios";
 import {
   ExchangeClient,
-  WebSocketClient,
-  Side,
-  formatWad,
-  parseWad,
-  type WsMessage,
-  type WsPositionUpdate,
   type Market,
 } from "risex-client";
+import * as fs from "fs";
+import * as path from "path";
 
+// ── Config ──────────────────────────────────────────────────
 const ACCOUNT_ADDRESS = process.env.ACCOUNT_ADDRESS!;
 const SIGNER_PRIVATE_KEY = process.env.SIGNER_PRIVATE_KEY!;
 const TARGET_ADDRESS =
@@ -19,12 +17,16 @@ const TARGET_ADDRESS =
 const TARGET_BALANCE_USD = parseFloat(process.env.TARGET_BALANCE_USD || "4500");
 const MY_BALANCE_USD = parseFloat(process.env.MY_BALANCE_USD || "100");
 const FIXED_LEVERAGE = parseInt(process.env.FIXED_LEVERAGE || "20", 10);
-const MIN_ORDER_VOLUME_USD = parseFloat(process.env.MIN_ORDER_VOLUME_USD || "1.5");
+const MIN_ORDER_VOLUME_USD = parseFloat(process.env.MIN_ORDER_VOLUME_USD || "10");
 const MAX_POSITIONS = parseInt(process.env.MAX_POSITIONS || "3", 10);
 const MAX_DAILY_LOSS_USD = parseFloat(process.env.MAX_DAILY_LOSS_USD || "20");
+const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "3000", 10);
 
-const API_URL = "https://api.risex.trade";
-const WS_URL = "wss://ws.risex.trade";
+const RISEX_API_URL = process.env.RISEX_API_URL || "https://api.risex.trade";
+const RISEX_WS_URL = process.env.RISEX_WS_URL || "wss://ws.risex.trade";
+const SCREENER_API = "https://risescreener.com/api/address";
+
+const STATE_FILE = path.join(__dirname, "..", "state.json");
 
 if (!ACCOUNT_ADDRESS || !SIGNER_PRIVATE_KEY) {
   console.error("Missing ACCOUNT_ADDRESS or SIGNER_PRIVATE_KEY in .env");
@@ -33,351 +35,391 @@ if (!ACCOUNT_ADDRESS || !SIGNER_PRIVATE_KEY) {
 
 const BASE_RATIO = MY_BALANCE_USD / TARGET_BALANCE_USD;
 
-interface TrackedPosition {
-  size: bigint;
-  side: Side;
+// ── Types ───────────────────────────────────────────────────
+interface ScreenerFill {
+  id: string;
+  market_id: string;
+  order_id: string;
+  side: "BUY" | "SELL";
+  price: string;
+  size: string;
+  time: string;
+  position_side: "BUY" | "SELL";
+  realized_pnl: string;
+  leverage: string;
+  is_liquidation: boolean;
+  is_otc: boolean;
 }
 
-const targetPositions = new Map<number, TrackedPosition>();
+interface ScreenerResponse {
+  account: string;
+  balance: number;
+  positions: Array<{
+    market_id: string;
+    side: string;
+    size: string;
+    entry_price: string;
+    [key: string]: unknown;
+  }>;
+  fills: ScreenerFill[];
+  symbols: Record<string, string>;
+}
+
+interface AggregatedOrder {
+  order_id: string;
+  market_id: number;
+  side: "BUY" | "SELL";
+  position_side: "BUY" | "SELL";
+  total_size: number;
+  avg_price: number;
+  realized_pnl: number;
+  is_closing: boolean;
+  timestamp: string;
+}
+
+interface BotState {
+  last_seen_fill_time: string;
+  last_seen_fill_ids: string[];
+  daily_loss: number;
+  daily_loss_date: string;
+  my_positions: Record<number, { side: string; size: number }>;
+}
+
+// ── Globals ─────────────────────────────────────────────────
 let exchange: ExchangeClient;
 let markets: Market[] = [];
-let processing = false;
-const pendingQueue: WsPositionUpdate[] = [];
+let symbols: Record<string, string> = {};
+let state: BotState = {
+  last_seen_fill_time: "0",
+  last_seen_fill_ids: [],
+  daily_loss: 0,
+  daily_loss_date: todayStr(),
+  my_positions: {},
+};
 
-let dailyLoss = 0;
-let dailyLossResetDate = todayDateStr();
-
-function todayDateStr(): string {
+// ── Helpers ─────────────────────────────────────────────────
+function todayStr(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-function checkAndResetDailyLoss() {
-  const today = todayDateStr();
-  if (today !== dailyLossResetDate) {
-    dailyLoss = 0;
-    dailyLossResetDate = today;
-    console.log("[RISK] Daily loss counter reset");
-  }
+function loadState(): BotState {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      return JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
+    }
+  } catch {}
+  return state;
 }
 
-function canTrade(): boolean {
-  checkAndResetDailyLoss();
-  if (dailyLoss >= MAX_DAILY_LOSS_USD) {
-    console.warn(`[RISK] Daily loss limit reached ($${dailyLoss.toFixed(2)} / $${MAX_DAILY_LOSS_USD}), skipping trade`);
+function saveState() {
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+function getMarket(marketId: number): Market | undefined {
+  return markets.find((m) => parseInt(m.market_id, 10) === marketId);
+}
+
+function sizeToSteps(size: number, stepSize: number): number {
+  return Math.floor(size / stepSize);
+}
+
+function checkDailyLoss(): boolean {
+  const today = todayStr();
+  if (today !== state.daily_loss_date) {
+    state.daily_loss = 0;
+    state.daily_loss_date = today;
+    log("RISK", "Daily loss counter reset");
+  }
+  if (state.daily_loss >= MAX_DAILY_LOSS_USD) {
+    log("RISK", `Daily loss limit reached ($${state.daily_loss.toFixed(2)} / $${MAX_DAILY_LOSS_USD})`);
     return false;
   }
   return true;
 }
 
-function marketIdNum(id: string | number): number {
-  return typeof id === "string" ? parseInt(id, 10) : id;
+function log(tag: string, msg: string) {
+  const ts = new Date().toISOString().slice(11, 19);
+  console.log(`[${ts}][${tag}] ${msg}`);
 }
 
-function getMarketConfig(marketId: number) {
-  return markets.find((m) => parseInt(m.market_id, 10) === marketId);
+// ── Screener Polling ────────────────────────────────────────
+async function fetchScreenerData(): Promise<ScreenerResponse> {
+  const { data } = await axios.get<ScreenerResponse>(
+    `${SCREENER_API}/${TARGET_ADDRESS}`,
+    { timeout: 10000 }
+  );
+  return data;
 }
 
-function sizeToSteps(size: bigint, stepSize: string): number {
-  const step = parseWad(stepSize);
-  if (step === 0n) return 0;
-  return Number(size / step);
-}
-
-function getMarkPrice(market: Market): number {
-  return parseFloat(formatWad(market.mark_price));
-}
-
-function scaleSize(targetSizeWad: bigint, market: Market): bigint {
-  let scaled = (targetSizeWad * BigInt(Math.round(BASE_RATIO * 1e8))) / 100_000_000n;
-
-  const markPrice = getMarkPrice(market);
-  if (markPrice <= 0) return scaled;
-
-  const sizeFloat = parseFloat(formatWad(scaled.toString()));
-  const volumeUsd = sizeFloat * markPrice;
-
-  if (volumeUsd < MIN_ORDER_VOLUME_USD) {
-    const minSize = MIN_ORDER_VOLUME_USD / markPrice;
-    scaled = parseWad(minSize.toFixed(18));
+function aggregateFills(fills: ScreenerFill[]): AggregatedOrder[] {
+  const byOrder = new Map<string, ScreenerFill[]>();
+  for (const fill of fills) {
+    const existing = byOrder.get(fill.order_id) || [];
+    existing.push(fill);
+    byOrder.set(fill.order_id, existing);
   }
 
-  const maxVolumePerPosition = (MY_BALANCE_USD * FIXED_LEVERAGE) / MAX_POSITIONS;
-  if (volumeUsd > maxVolumePerPosition) {
-    const cappedSize = maxVolumePerPosition / markPrice;
-    scaled = parseWad(cappedSize.toFixed(18));
-    console.log(`[RISK] Capped position to $${maxVolumePerPosition.toFixed(2)} notional`);
+  const orders: AggregatedOrder[] = [];
+  for (const [order_id, orderFills] of byOrder) {
+    const first = orderFills[0];
+    let totalSize = 0;
+    let totalNotional = 0;
+    let totalPnl = 0;
+
+    for (const f of orderFills) {
+      const size = parseFloat(f.size);
+      totalSize += size;
+      totalNotional += size * parseFloat(f.price);
+      totalPnl += parseFloat(f.realized_pnl);
+    }
+
+    orders.push({
+      order_id,
+      market_id: parseInt(first.market_id, 10),
+      side: first.side,
+      position_side: first.position_side,
+      total_size: totalSize,
+      avg_price: totalSize > 0 ? totalNotional / totalSize : 0,
+      realized_pnl: totalPnl,
+      is_closing: totalPnl !== 0,
+      timestamp: first.time,
+    });
+  }
+
+  return orders.sort((a, b) => (a.timestamp < b.timestamp ? -1 : 1));
+}
+
+function findNewFills(fills: ScreenerFill[]): ScreenerFill[] {
+  const lastTime = state.last_seen_fill_time;
+  const seenIds = new Set(state.last_seen_fill_ids);
+
+  return fills.filter((f) => {
+    if (f.time > lastTime) return true;
+    if (f.time === lastTime && !seenIds.has(f.id)) return true;
+    return false;
+  });
+}
+
+// ── Copy Trading ────────────────────────────────────────────
+function scaleSize(targetSize: number, marketPrice: number): number {
+  let scaled = targetSize * BASE_RATIO;
+
+  const volumeUsd = scaled * marketPrice;
+
+  if (volumeUsd < MIN_ORDER_VOLUME_USD) {
+    scaled = MIN_ORDER_VOLUME_USD / marketPrice;
+  }
+
+  const maxVolumePerPos = (MY_BALANCE_USD * FIXED_LEVERAGE) / MAX_POSITIONS;
+  if (volumeUsd > maxVolumePerPos) {
+    scaled = maxVolumePerPos / marketPrice;
+    log("RISK", `Capped to $${maxVolumePerPos.toFixed(2)} notional`);
   }
 
   return scaled;
 }
 
-function activePositionCount(): number {
-  return targetPositions.size;
-}
-
-async function handlePositionUpdate(update: WsPositionUpdate) {
-  const mktId = marketIdNum(update.market_id);
-  const market = getMarketConfig(mktId);
+async function copyOrder(order: AggregatedOrder, targetPositions: ScreenerResponse["positions"]) {
+  const market = getMarket(order.market_id);
   if (!market) {
-    console.warn(`Unknown market ${mktId}, skipping`);
+    log("COPY", `Unknown market ${order.market_id}, skipping`);
     return;
   }
 
-  const newSizeWad = parseWad(update.size);
-  const newSide: Side = update.side;
-  const prev = targetPositions.get(mktId);
+  const symbol = symbols[order.market_id.toString()] || `M${order.market_id}`;
+  const stepSize = parseFloat(market.config.step_size);
 
-  const prevSize = prev?.size ?? 0n;
-  const prevSide = prev?.side ?? Side.Long;
-
-  if (newSizeWad === 0n) {
-    targetPositions.delete(mktId);
-  } else {
-    targetPositions.set(mktId, { size: newSizeWad, side: newSide });
-  }
-
-  const stepSize = market.config.step_size;
-
-  if (newSizeWad === 0n && prevSize > 0n) {
-    console.log(`[COPY] Target fully closed on ${market.display_name} → closing our position`);
-    try {
-      const result = await exchange.closePosition(mktId);
-      if (result) {
-        console.log(`[COPY] Closed position on ${market.display_name}: tx=${result.tx_hash}`);
-      } else {
-        console.log(`[COPY] No position to close on ${market.display_name}`);
-      }
-    } catch (err) {
-      console.error(`[COPY] Failed to close on ${market.display_name}:`, err);
-    }
-    return;
-  }
-
-  if (prevSize === 0n && newSizeWad > 0n) {
-    if (!canTrade()) return;
-
-    if (activePositionCount() > MAX_POSITIONS) {
-      console.warn(`[RISK] Max ${MAX_POSITIONS} positions reached, skipping new position on ${market.display_name}`);
-      return;
-    }
-
-    const copySize = scaleSize(newSizeWad, market);
-    const steps = sizeToSteps(copySize, stepSize);
-    if (steps <= 0) {
-      console.warn(`[COPY] Calculated 0 steps for ${market.display_name}, skipping`);
-      return;
-    }
-
-    const markPrice = getMarkPrice(market);
-    const notional = parseFloat(formatWad(copySize.toString())) * markPrice;
-    console.log(
-      `[COPY] Target opened ${newSide === Side.Long ? "LONG" : "SHORT"} on ${market.display_name} ` +
-      `| Target size: ${formatWad(newSizeWad.toString())} | Our size: ${formatWad(copySize.toString())} (~$${notional.toFixed(2)})`
+  if (order.is_closing) {
+    const targetStillHasPosition = targetPositions.some(
+      (p) => parseInt(p.market_id, 10) === order.market_id
     );
 
-    try {
-      const result =
-        newSide === Side.Long
-          ? await exchange.marketBuy(mktId, steps)
-          : await exchange.marketSell(mktId, steps);
-      console.log(`[COPY] Opened position: tx=${result.tx_hash}`);
-    } catch (err) {
-      console.error(`[COPY] Failed to open on ${market.display_name}:`, err);
-    }
-    return;
-  }
-
-  if (prevSize > 0n && newSizeWad > 0n && prevSide !== newSide) {
-    console.log(`[COPY] Target flipped on ${market.display_name} → closing & reopening`);
-    try {
-      const closeResult = await exchange.closePosition(mktId);
-      if (closeResult) {
-        console.log(`[COPY] Closed old position: tx=${closeResult.tx_hash}`);
+    if (targetStillHasPosition) {
+      // Partial close — target still has a position, reduce ours proportionally
+      const myPos = state.my_positions[order.market_id];
+      if (!myPos) {
+        log("COPY", `Target partial closed ${symbol} but we have no position, skipping`);
+        return;
       }
 
-      if (!canTrade()) return;
+      const targetRemaining = targetPositions.find(
+        (p) => parseInt(p.market_id, 10) === order.market_id
+      )!;
+      const remainingSize = parseFloat(targetRemaining.size);
+      const closedSize = order.total_size;
+      const totalBefore = remainingSize + closedSize;
+      const reductionRatio = closedSize / totalBefore;
 
-      const copySize = scaleSize(newSizeWad, market);
-      const steps = sizeToSteps(copySize, stepSize);
-      if (steps > 0) {
-        const result =
-          newSide === Side.Long
-            ? await exchange.marketBuy(mktId, steps)
-            : await exchange.marketSell(mktId, steps);
-        console.log(`[COPY] Opened flipped position: tx=${result.tx_hash}`);
+      const reduceAmount = myPos.size * reductionRatio;
+      const reduceNotional = reduceAmount * order.avg_price;
+
+      if (reduceNotional < MIN_ORDER_VOLUME_USD) {
+        log("COPY", `Partial close on ${symbol} too small ($${reduceNotional.toFixed(2)} < $${MIN_ORDER_VOLUME_USD}), skipping`);
+        return;
       }
-    } catch (err) {
-      console.error(`[COPY] Failed to flip on ${market.display_name}:`, err);
-    }
-    return;
-  }
 
-  if (prevSize > 0n && newSizeWad > 0n && prevSide === newSide) {
-    const sizeDelta = newSizeWad - prevSize;
-    if (sizeDelta === 0n) return;
-
-    if (sizeDelta > 0n) {
-      if (!canTrade()) return;
-
-      const scaledDelta = scaleSize(sizeDelta, market);
-      const steps = sizeToSteps(scaledDelta, stepSize);
+      const steps = sizeToSteps(reduceAmount, stepSize);
       if (steps <= 0) return;
 
-      const markPrice = getMarkPrice(market);
-      const notional = parseFloat(formatWad(scaledDelta.toString())) * markPrice;
-      console.log(`[COPY] Target increased on ${market.display_name} | +${formatWad(scaledDelta.toString())} (~$${notional.toFixed(2)})`);
+      log("COPY", `Target partial closed ${(reductionRatio * 100).toFixed(1)}% of ${symbol} | Reducing ${reduceAmount.toFixed(6)} (~$${reduceNotional.toFixed(2)})`);
 
       try {
         const result =
-          newSide === Side.Long
-            ? await exchange.marketBuy(mktId, steps)
-            : await exchange.marketSell(mktId, steps);
-        console.log(`[COPY] Increased position: tx=${result.tx_hash}`);
+          myPos.side === "BUY"
+            ? await exchange.marketSell(order.market_id, steps, true)
+            : await exchange.marketBuy(order.market_id, steps);
+        log("COPY", `Reduced ${symbol}: tx=${result.tx_hash}`);
+        myPos.size -= reduceAmount;
+        if (myPos.size <= 0) delete state.my_positions[order.market_id];
+        saveState();
       } catch (err) {
-        console.error(`[COPY] Failed to increase:`, err);
+        log("COPY", `Failed to reduce ${symbol}: ${(err as Error).message}`);
       }
     } else {
-      const reduction = -sizeDelta;
-      const reductionRatio = Number((reduction * 10000n) / prevSize) / 10000;
-
-      if (reductionRatio > 0.95) {
-        console.log(`[COPY] Target closed ~100% on ${market.display_name} → closing our position`);
-        try {
-          const result = await exchange.closePosition(mktId);
-          if (result) console.log(`[COPY] Closed position: tx=${result.tx_hash}`);
-        } catch (err) {
-          console.error(`[COPY] Failed to close:`, err);
-        }
-        return;
-      }
-
-      const myPositions = await exchange.info.getAllPositions(ACCOUNT_ADDRESS);
-      const myPos = myPositions.find((p) => parseInt(p.market_id, 10) === mktId);
-      if (!myPos) {
-        console.warn(`[COPY] No position found to reduce on ${market.display_name}`);
-        return;
-      }
-
-      const mySizeWad = parseWad(myPos.size);
-      const closeAmount = BigInt(Math.round(Number(mySizeWad) * reductionRatio));
-      const steps = sizeToSteps(closeAmount, stepSize);
-      if (steps <= 0) return;
-
-      const markPrice = getMarkPrice(market);
-      const notional = parseFloat(formatWad(closeAmount.toString())) * markPrice;
-      console.log(
-        `[COPY] Target reduced ${(reductionRatio * 100).toFixed(1)}% on ${market.display_name} ` +
-        `| Closing ${formatWad(closeAmount.toString())} (~$${notional.toFixed(2)})`
-      );
+      // Full close — target has no remaining position
+      log("COPY", `Target FULLY CLOSED ${symbol} | PnL: $${order.realized_pnl.toFixed(2)}`);
 
       try {
-        const result =
-          newSide === Side.Long
-            ? await exchange.marketSell(mktId, steps, true)
-            : await exchange.marketBuy(mktId, steps);
-        console.log(`[COPY] Reduced position: tx=${result.tx_hash}`);
-
-        const pnl = myPos.unrealized_pnl ? parseFloat(formatWad(myPos.unrealized_pnl)) : 0;
-        if (pnl < 0) {
-          dailyLoss += Math.abs(pnl) * reductionRatio;
-          console.log(`[RISK] Daily loss now: $${dailyLoss.toFixed(2)} / $${MAX_DAILY_LOSS_USD}`);
+        const result = await exchange.closePosition(order.market_id);
+        if (result) {
+          log("COPY", `Closed ${symbol}: tx=${result.tx_hash}`);
+        } else {
+          log("COPY", `No position to close on ${symbol}`);
         }
+        delete state.my_positions[order.market_id];
+        saveState();
       } catch (err) {
-        console.error(`[COPY] Failed to reduce:`, err);
+        log("COPY", `Failed to close ${symbol}: ${(err as Error).message}`);
       }
     }
+    return;
+  }
+
+  // Target is opening a position
+  if (!checkDailyLoss()) return;
+
+  const activeCount = Object.keys(state.my_positions).length;
+  if (activeCount >= MAX_POSITIONS) {
+    log("RISK", `Max ${MAX_POSITIONS} positions, skipping ${symbol}`);
+    return;
+  }
+
+  const copySize = scaleSize(order.total_size, order.avg_price);
+  const steps = sizeToSteps(copySize, stepSize);
+  if (steps <= 0) {
+    log("COPY", `0 steps for ${symbol}, skipping`);
+    return;
+  }
+
+  const notional = copySize * order.avg_price;
+  const copySide = order.side === "BUY" ? "LONG" : "SHORT";
+
+  log(
+    "COPY",
+    `Target opened ${copySide} ${symbol} | ` +
+    `Target: ${order.total_size.toFixed(6)} @ $${order.avg_price.toFixed(1)} | ` +
+    `Ours: ${copySize.toFixed(6)} (~$${notional.toFixed(2)}) | ${steps} steps`
+  );
+
+  try {
+    const result =
+      order.side === "BUY"
+        ? await exchange.marketBuy(order.market_id, steps)
+        : await exchange.marketSell(order.market_id, steps);
+
+    log("COPY", `Opened ${copySide} ${symbol}: tx=${result.tx_hash}`);
+    state.my_positions[order.market_id] = { side: order.side, size: copySize };
+    saveState();
+
+  } catch (err) {
+    log("COPY", `Failed to open ${symbol}: ${(err as Error).message}`);
   }
 }
 
-async function processQueue() {
-  if (processing) return;
-  processing = true;
-  while (pendingQueue.length > 0) {
-    const update = pendingQueue.shift()!;
-    await handlePositionUpdate(update);
-  }
-  processing = false;
-}
+// ── Main Poll Loop ──────────────────────────────────────────
+async function poll() {
+  try {
+    const data = await fetchScreenerData();
+    symbols = data.symbols;
 
-async function initTargetPositions() {
-  console.log(`[INIT] Fetching current positions for target ${TARGET_ADDRESS}`);
-  const positions = await exchange.info.getAllPositions(TARGET_ADDRESS);
-  for (const pos of positions) {
-    const size = parseWad(pos.size);
-    if (size > 0n) {
-      targetPositions.set(parseInt(pos.market_id, 10), {
-        size,
-        side: pos.side as Side,
-      });
-      console.log(
-        `[INIT] Target has ${pos.side === Side.Long ? "LONG" : "SHORT"} ${formatWad(pos.size)} on market ${pos.market_id}`
-      );
+    const newFills = findNewFills(data.fills);
+    if (newFills.length === 0) return;
+
+    log("POLL", `${newFills.length} new fills detected`);
+
+    const orders = aggregateFills(newFills);
+    for (const order of orders) {
+      await copyOrder(order, data.positions);
     }
+
+    // Update state with latest fill time
+    const allTimes = newFills.map((f) => f.time);
+    const maxTime = allTimes.reduce((a, b) => (a > b ? a : b));
+    state.last_seen_fill_time = maxTime;
+    state.last_seen_fill_ids = newFills
+      .filter((f) => f.time === maxTime)
+      .map((f) => f.id);
+    saveState();
+  } catch (err) {
+    log("POLL", `Error: ${(err as Error).message}`);
   }
 }
 
-async function connectWebSocket() {
-  const ws = new WebSocketClient({ wsUrl: WS_URL, logLevel: "info" });
-
-  ws.on("open", () => {
-    console.log("[WS] Connected");
-    ws.subscribe({
-      channel: "positions",
-      makers: [TARGET_ADDRESS],
-    });
-    console.log(`[WS] Subscribed to positions for ${TARGET_ADDRESS}`);
-  });
-
-  ws.on("close", () => {
-    console.log("[WS] Disconnected, will auto-reconnect...");
-  });
-
-  ws.on("error", (err) => {
-    console.error("[WS] Error:", err);
-  });
-
-  ws.onChannel("positions", (msg: WsMessage) => {
-    const data = msg.data as WsPositionUpdate | WsPositionUpdate[];
-    const updates = Array.isArray(data) ? data : [data];
-    for (const update of updates) {
-      pendingQueue.push(update);
-    }
-    processQueue();
-  });
-
-  await ws.connect();
-  return ws;
-}
-
+// ── Startup ─────────────────────────────────────────────────
 async function main() {
   console.log("=== RISEx Copy Trade Bot ===");
   console.log(`Account:    ${ACCOUNT_ADDRESS}`);
   console.log(`Target:     ${TARGET_ADDRESS}`);
-  console.log(`Mode:       proportional (${MY_BALANCE_USD}$ / ${TARGET_BALANCE_USD}$ = ${(BASE_RATIO * 100).toFixed(2)}%)`);
+  console.log(`Ratio:      ${(BASE_RATIO * 100).toFixed(2)}% ($${MY_BALANCE_USD} / $${TARGET_BALANCE_USD})`);
   console.log(`Leverage:   x${FIXED_LEVERAGE}`);
   console.log(`Min order:  $${MIN_ORDER_VOLUME_USD}`);
   console.log(`Max pos:    ${MAX_POSITIONS}`);
   console.log(`Max loss:   $${MAX_DAILY_LOSS_USD}/day`);
+  console.log(`Poll:       every ${POLL_INTERVAL_MS}ms`);
   console.log();
 
+  // Load persisted state
+  state = loadState();
+  log("INIT", `Loaded state: last fill time = ${state.last_seen_fill_time}`);
+
+  // Init exchange client for placing orders
   exchange = new ExchangeClient({
-    baseUrl: API_URL,
-    wsUrl: WS_URL,
+    baseUrl: RISEX_API_URL,
+    wsUrl: RISEX_WS_URL,
     account: ACCOUNT_ADDRESS,
     signerKey: SIGNER_PRIVATE_KEY,
-    logLevel: "info",
+    logLevel: "warn",
   });
-
   await exchange.init();
-  console.log("[INIT] Exchange client initialized");
+  log("INIT", "Exchange client initialized");
 
+  // Load markets
   markets = await exchange.info.getMarkets();
-  console.log(`[INIT] Loaded ${markets.length} markets`);
+  log("INIT", `Loaded ${markets.length} markets`);
 
-  await initTargetPositions();
-  await connectWebSocket();
+  // Seed fill history so we don't copy old trades on first run
+  if (state.last_seen_fill_time === "0") {
+    log("INIT", "First run — seeding fill history...");
+    const data = await fetchScreenerData();
+    symbols = data.symbols;
+    if (data.fills.length > 0) {
+      const maxTime = data.fills.reduce((a, b) => (a.time > b.time ? a : b)).time;
+      state.last_seen_fill_time = maxTime;
+      state.last_seen_fill_ids = data.fills
+        .filter((f) => f.time === maxTime)
+        .map((f) => f.id);
+      saveState();
+      log("INIT", `Seeded with ${data.fills.length} historical fills, latest time: ${maxTime}`);
+    }
 
-  console.log("[BOT] Listening for target position changes...");
+    // Sync current target positions
+    for (const pos of data.positions) {
+      log("INIT", `Target has open position: ${symbols[pos.market_id] || pos.market_id} ${pos.side} ${pos.size}`);
+    }
+  }
+
+  log("BOT", "Polling for new trades...");
+  setInterval(poll, POLL_INTERVAL_MS);
 }
 
 main().catch((err) => {
