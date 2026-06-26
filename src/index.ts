@@ -173,6 +173,8 @@ function aggregateFills(fills: ScreenerFill[]): AggregatedOrder[] {
       totalPnl += parseFloat(f.realized_pnl);
     }
 
+    const isClosing = first.side !== first.position_side;
+
     orders.push({
       order_id,
       market_id: parseInt(first.market_id, 10),
@@ -181,7 +183,7 @@ function aggregateFills(fills: ScreenerFill[]): AggregatedOrder[] {
       total_size: totalSize,
       avg_price: totalSize > 0 ? totalNotional / totalSize : 0,
       realized_pnl: totalPnl,
-      is_closing: totalPnl !== 0,
+      is_closing: isClosing,
       timestamp: first.time,
     });
   }
@@ -343,12 +345,17 @@ async function poll() {
     symbols = data.symbols;
 
     const newFills = findNewFills(data.fills);
-    if (newFills.length === 0) return;
+    if (newFills.length === 0) {
+      if (Math.random() < 0.01) log("POLL", `Alive — ${data.fills.length} total fills, 0 new`);
+      return;
+    }
 
     log("POLL", `${newFills.length} new fills detected`);
 
     const orders = aggregateFills(newFills);
     for (const order of orders) {
+      const sym = symbols[order.market_id.toString()] || `M${order.market_id}`;
+      log("POLL", `Order: ${sym} ${order.side} size=${order.total_size.toFixed(6)} pnl=${order.realized_pnl.toFixed(2)} closing=${order.is_closing} pos_side=${order.position_side}`);
       await copyOrder(order, data.positions);
     }
 
