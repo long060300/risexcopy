@@ -221,6 +221,28 @@ function scaleSize(targetSize: number, marketPrice: number): number {
   return scaled;
 }
 
+// Track markets where leverage has already been set this session
+const leverageSet = new Set<number>();
+
+async function ensureLeverage(marketId: number, market: Market, symbol: string) {
+  if (leverageSet.has(marketId)) return;
+
+  const maxLev = parseInt(market.config.max_leverage || "0", 10);
+  let lev = FIXED_LEVERAGE;
+  if (maxLev > 0 && lev > maxLev) {
+    log("RISK", `${symbol} max leverage is x${maxLev}, capping from x${FIXED_LEVERAGE}`);
+    lev = maxLev;
+  }
+
+  try {
+    await exchange.updateLeverage(marketId, BigInt(lev));
+    leverageSet.add(marketId);
+    log("LEV", `Set ${symbol} leverage to x${lev}`);
+  } catch (err) {
+    log("LEV", `Failed to set leverage for ${symbol}: ${(err as Error).message}`);
+  }
+}
+
 async function copyOrder(order: AggregatedOrder, targetPositions: ScreenerResponse["positions"]) {
   const market = getMarket(order.market_id);
   if (!market) {
@@ -323,6 +345,9 @@ async function copyOrder(order: AggregatedOrder, targetPositions: ScreenerRespon
     `Ours: ${copySize.toFixed(6)} (~$${notional.toFixed(2)}) | ${steps} steps`
   );
 
+  // Ensure our leverage matches FIXED_LEVERAGE before opening
+  await ensureLeverage(order.market_id, market, symbol);
+
   try {
     const result =
       order.side === "BUY"
@@ -399,6 +424,34 @@ async function main() {
   });
   await exchange.init();
   log("INIT", "Exchange client initialized");
+
+  // Verify the signer is authorized to trade on this account
+  try {
+    const registered = await exchange.isSignerRegistered();
+    if (!registered) {
+      console.error(
+        "\n❌ SIGNER NOT REGISTERED\n" +
+        `The signer key is NOT authorized to trade on ${ACCOUNT_ADDRESS}.\n` +
+        "Create a signer/API key in the RISEx web app (it auto-registers),\n" +
+        "then put its private key in SIGNER_PRIVATE_KEY. Bot cannot place orders until then.\n"
+      );
+      process.exit(1);
+    }
+    log("INIT", "✓ Signer is registered and authorized");
+  } catch (err) {
+    log("INIT", `Could not verify signer status: ${(err as Error).message} (continuing)`);
+  }
+
+  // Check account balance
+  try {
+    const balance = await exchange.info.getBalance(ACCOUNT_ADDRESS);
+    log("INIT", `Account balance: $${parseFloat(balance).toFixed(2)}`);
+    if (parseFloat(balance) <= 0) {
+      log("INIT", "⚠️  Balance is 0 — deposit USDC into RISEx before the bot can open positions");
+    }
+  } catch (err) {
+    log("INIT", `Could not fetch balance: ${(err as Error).message}`);
+  }
 
   // Load markets
   markets = await exchange.info.getMarkets();
