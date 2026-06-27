@@ -22,8 +22,8 @@ const MAX_POSITIONS = parseInt(process.env.MAX_POSITIONS || "3", 10);
 const MAX_DAILY_LOSS_USD = parseFloat(process.env.MAX_DAILY_LOSS_USD || "20");
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "3000", 10);
 
-const RISEX_API_URL = process.env.RISEX_API_URL || "https://api.risex.trade";
-const RISEX_WS_URL = process.env.RISEX_WS_URL || "wss://ws.risex.trade";
+const RISEX_API_URL = process.env.RISEX_API_URL || "https://api.rise.trade";
+const RISEX_WS_URL = process.env.RISEX_WS_URL || "wss://ws.rise.trade/ws";
 const SCREENER_API = "https://risescreener.com/api/address";
 
 const STATE_FILE = path.join(__dirname, "..", "state.json");
