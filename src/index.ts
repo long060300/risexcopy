@@ -22,8 +22,8 @@ const MAX_POSITIONS = parseInt(process.env.MAX_POSITIONS || "3", 10);
 const MAX_DAILY_LOSS_USD = parseFloat(process.env.MAX_DAILY_LOSS_USD || "20");
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "3000", 10);
 
-const RISEX_API_URL = process.env.RISEX_API_URL || "https://api.risex.trade";
-const RISEX_WS_URL = process.env.RISEX_WS_URL || "wss://ws.risex.trade";
+const RISEX_API_URL = process.env.RISEX_API_URL || "https://api.rise.trade";
+const RISEX_WS_URL = process.env.RISEX_WS_URL || "wss://ws.rise.trade/ws";
 const SCREENER_API = "https://risescreener.com/api/address";
 
 const STATE_FILE = path.join(__dirname, "..", "state.json");
@@ -173,6 +173,8 @@ function aggregateFills(fills: ScreenerFill[]): AggregatedOrder[] {
       totalPnl += parseFloat(f.realized_pnl);
     }
 
+    const isClosing = first.side !== first.position_side;
+
     orders.push({
       order_id,
       market_id: parseInt(first.market_id, 10),
@@ -181,7 +183,7 @@ function aggregateFills(fills: ScreenerFill[]): AggregatedOrder[] {
       total_size: totalSize,
       avg_price: totalSize > 0 ? totalNotional / totalSize : 0,
       realized_pnl: totalPnl,
-      is_closing: totalPnl !== 0,
+      is_closing: isClosing,
       timestamp: first.time,
     });
   }
@@ -217,6 +219,28 @@ function scaleSize(targetSize: number, marketPrice: number): number {
   }
 
   return scaled;
+}
+
+// Track markets where leverage has already been set this session
+const leverageSet = new Set<number>();
+
+async function ensureLeverage(marketId: number, market: Market, symbol: string) {
+  if (leverageSet.has(marketId)) return;
+
+  const maxLev = parseInt(market.config.max_leverage || "0", 10);
+  let lev = FIXED_LEVERAGE;
+  if (maxLev > 0 && lev > maxLev) {
+    log("RISK", `${symbol} max leverage is x${maxLev}, capping from x${FIXED_LEVERAGE}`);
+    lev = maxLev;
+  }
+
+  try {
+    await exchange.updateLeverage(marketId, BigInt(lev));
+    leverageSet.add(marketId);
+    log("LEV", `Set ${symbol} leverage to x${lev}`);
+  } catch (err) {
+    log("LEV", `Failed to set leverage for ${symbol}: ${(err as Error).message}`);
+  }
 }
 
 async function copyOrder(order: AggregatedOrder, targetPositions: ScreenerResponse["positions"]) {
@@ -321,6 +345,9 @@ async function copyOrder(order: AggregatedOrder, targetPositions: ScreenerRespon
     `Ours: ${copySize.toFixed(6)} (~$${notional.toFixed(2)}) | ${steps} steps`
   );
 
+  // Ensure our leverage matches FIXED_LEVERAGE before opening
+  await ensureLeverage(order.market_id, market, symbol);
+
   try {
     const result =
       order.side === "BUY"
@@ -343,12 +370,17 @@ async function poll() {
     symbols = data.symbols;
 
     const newFills = findNewFills(data.fills);
-    if (newFills.length === 0) return;
+    if (newFills.length === 0) {
+      if (Math.random() < 0.01) log("POLL", `Alive — ${data.fills.length} total fills, 0 new`);
+      return;
+    }
 
     log("POLL", `${newFills.length} new fills detected`);
 
     const orders = aggregateFills(newFills);
     for (const order of orders) {
+      const sym = symbols[order.market_id.toString()] || `M${order.market_id}`;
+      log("POLL", `Order: ${sym} ${order.side} size=${order.total_size.toFixed(6)} pnl=${order.realized_pnl.toFixed(2)} closing=${order.is_closing} pos_side=${order.position_side}`);
       await copyOrder(order, data.positions);
     }
 
@@ -392,6 +424,34 @@ async function main() {
   });
   await exchange.init();
   log("INIT", "Exchange client initialized");
+
+  // Verify the signer is authorized to trade on this account
+  try {
+    const registered = await exchange.isSignerRegistered();
+    if (!registered) {
+      console.error(
+        "\n❌ SIGNER NOT REGISTERED\n" +
+        `The signer key is NOT authorized to trade on ${ACCOUNT_ADDRESS}.\n` +
+        "Create a signer/API key in the RISEx web app (it auto-registers),\n" +
+        "then put its private key in SIGNER_PRIVATE_KEY. Bot cannot place orders until then.\n"
+      );
+      process.exit(1);
+    }
+    log("INIT", "✓ Signer is registered and authorized");
+  } catch (err) {
+    log("INIT", `Could not verify signer status: ${(err as Error).message} (continuing)`);
+  }
+
+  // Check account balance
+  try {
+    const balance = await exchange.info.getBalance(ACCOUNT_ADDRESS);
+    log("INIT", `Account balance: $${parseFloat(balance).toFixed(2)}`);
+    if (parseFloat(balance) <= 0) {
+      log("INIT", "⚠️  Balance is 0 — deposit USDC into RISEx before the bot can open positions");
+    }
+  } catch (err) {
+    log("INIT", `Could not fetch balance: ${(err as Error).message}`);
+  }
 
   // Load markets
   markets = await exchange.info.getMarkets();
